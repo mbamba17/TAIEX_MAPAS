@@ -8,7 +8,6 @@ library(scales)
 library(broom)
 library(corrplot)
 
-reg = data.frame(geo=c("AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","EL","HU","IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE","UK","LI","IS","NO"),ctry=c("AUT","BEL","BLG","HRV","CYP","CZE","DNK","EST","FIN","FRA","DEU","GRC","HUN","IRL","ITA","LVA","LTU","LUX","MLT","NLD","POL","PRT","ROU","SVK","SVN","ESP","SWE","GBR","LIE","ISL","NOR"),country=c("Austria","Belgium","Bulgaria","Croatia","Cyprus","Czech Rep.","Denmark","Estonia","Finland","France","Germany","Greece","Hungary","Ireland","Italy","Latvia","Lithuania","Luxembourg","Malta","Netherlands","Poland","Portugal","Romania","Slovakia","Slovenia","Spain","Sweden","United Kingdom","Lichenstein","Iceland","Norway"),regija=c("Ostale zemlje EU-a","Ostale zemlje EU-a","Zemlje SIE","HR","Ostale zemlje EU-a","Zemlje SIE","Ostale zemlje EU-a","Zemlje SIE","Ostale zemlje EU-a","Ostale zemlje EU-a","Ostale zemlje EU-a","Ostale zemlje EU-a","Zemlje SIE","Ostale zemlje EU-a","Ostale zemlje EU-a","Zemlje SIE","Zemlje SIE","Ostale zemlje EU-a","Ostale zemlje EU-a","Ostale zemlje EU-a","Zemlje SIE","Ostale zemlje EU-a","Zemlje SIE","Zemlje SIE","Zemlje SIE","Ostale zemlje EU-a","Ostale zemlje EU-a","Ostale zemlje EU-a","EEA","EEA","EEA"))
 # Tema
 gtema <- theme_minimal() + theme(panel.background = element_rect(fill="white",linetype = 0),plot.background = element_rect(fill="white",linetype = 0),legend.box.background = element_rect(fill="white",linetype = 0),text = element_text(colour = "#000000"),plot.caption = element_text(hjust = 0),legend.position = "top",legend.title = element_blank(),panel.border = element_blank(),axis.line = element_blank(),panel.grid.major = element_line(size = 0.5, linetype = "dotted",colour = "#233142"))
 theme_set(gtema)
@@ -17,21 +16,7 @@ theme_set(gtema)
 boje_fill <- scale_fill_manual(values = c("#155e63","#e84545","#25a55f","#ffc93c","#9b5d73","#ff7c38","#7e6752","#679186","#2e99b0","#01d28e","#cd8d7b","#bbbbbb","#f7be16","#b5525c","#4f81c7","#ff8a5c","#32ff6a","#393e46","#df0054","#f69314"))
 boje_col <- scale_color_manual(values = c("#155e63","#e84545","#25a55f","#ffc93c","#9b5d73","#ff7c38","#7e6752","#679186","#2e99b0","#01d28e","#cd8d7b","#bbbbbb","#f7be16","#b5525c","#4f81c7","#ff8a5c","#32ff6a","#393e46","#df0054","#f69314"))
 
-# PART 0. Data imoprt ####
-
-# mandatory funds
-# mandatory <- read_excel("obvezni_povijest.xlsx")
-# pom1 <- mandatory %>% select(date=1,value=3) %>% mutate(fund="SAVA") %>% na.omit() %>% mutate(date1=dmy_hms(date),date2=as.Date(as.numeric(date),origin="1899-12-30")) %>% mutate(date=case_when(!is.na(date1)~as.Date(date1),T~date2)) %>% select(-date1,-date2)
-# pom2 <- mandatory %>% select(date=5,value=7) %>% mutate(fund="KB") %>% na.omit() %>% mutate(date1=dmy_hms(date),date2=as.Date(as.numeric(date),origin="1899-12-30")) %>% mutate(date=case_when(!is.na(date1)~as.Date(date1),T~date2)) %>% select(-date1,-date2)
-# mandatory <- bind_rows(pom1,pom2)
-# rm(pom1,pom2)
-
-# voluntary funds
-# voluntary <- read_excel("dobrovoljni_povijest.xlsx")
-# pom1 <- voluntary %>% select(date=2,value=4) %>% mutate(fund="Sava Penzija Plus")
-# pom2 <- voluntary %>% select(date=6,value=8) %>% mutate(fund="KB Prv otvoren dobrovolen PF")
-# voluntary <- bind_rows(pom1,pom2)
-# rm(pom1,pom2)
+# PART 0. Data import ####
 
 # nav data
 pension_data <- read_excel("nav_opce.xlsx") %>% rename(date=1,fund_original=2,value=3,nav=4)
@@ -50,9 +35,6 @@ pension_data <- pension_data %>% mutate(value = sapply(value, convert_to_decimal
 
 rm(names)
 
-# macroeconomic data
-
-macro_data <- read_excel("macro_indicators.xlsx") %>% mutate(date=as.Date(date))
 
 # PART 1. Performance ####
 
@@ -95,14 +77,7 @@ rm(annualized_returns_data)
 ## 1.3. Creating a benchmark ####
 
 # by individual classes
-load("D:/mbamba/eod/eod_tickeri.Rda")
-bonds <- fromJSON(str_c("https://eodhistoricaldata.com/api/eod/IBGY.LSE?from=2010-01-01&to=2024-03-01&period=d&fmt=json&api_token=629ee72d6f94c6.88901546")) %>% select(date,close) %>% mutate(fund="iShares € Govt Bond 5-7yr UCITS ETF EUR (Dist) GBP",category="Bonds")
-stocks <- fromJSON(str_c("https://eodhistoricaldata.com/api/eod/EXSA.F?from=2010-01-01&to=2024-03-01&period=d&fmt=json&api_token=629ee72d6f94c6.88901546")) %>% select(date,close) %>% mutate(fund="iShares STOXX Europe 600 UCITS ETF (DE)",category="Stocks")
-inv_funds <- fromJSON(str_c("https://eodhistoricaldata.com/api/eod/GB00B4Y62W78.EUFUND?from=2010-01-01&to=2024-03-01&period=d&fmt=json&api_token=629ee72d6f94c6.88901546")) %>% select(date,close) %>% mutate(fund="BlackRock European Absolute Alpha D Acc",category="Inv. Funds")
-cash <- fromJSON(str_c("https://eodhistoricaldata.com/api/eod/IE00B0XJBQ64.EUFUND?from=2010-01-01&to=2024-03-01&period=d&fmt=json&api_token=629ee72d6f94c6.88901546")) %>% select(date,close) %>% mutate(fund="Pimco Euribor Plus",category="Cash")
-benchmark <- bonds %>% bind_rows(stocks) %>% bind_rows(inv_funds) %>% bind_rows(cash) %>% mutate(date=as.Date(date))
-first <- benchmark %>% group_by(category) %>% slice_head(n=1) %>% select(category,start=close)
-benchmark <- benchmark %>% left_join(first,by="category") %>% mutate(close=close/start*100)
+benchmark <- read_excel("Day3_data.xlsx",sheet = "benchmark_data") %>% mutate(date=as.Date(date)) 
 emf("./slike/304_benchmarks_classes.emf",width = 7,height = 6)
 ggplot(benchmark,aes(x=date,y=close,col=category)) + geom_line(linewidth=1.4) + boje_col + labs(x="Date",y="Close value") + plot_annotation(title = "Benchmarks for Different Asset Classes",subtitle = "Index, 100=2010-01-01",caption = "Source: EOD Historical Data")
 dev.off()
@@ -139,8 +114,6 @@ capm_results <- joined_returns %>%  group_by(fund) %>%  do(tidy(lm(fund_excess_r
 emf("./slike/306_alpha.emf",width = 7,height = 6)
 ggplot(capm_results,aes(x=fund,y=alpha,fill=fund)) + geom_col(alpha=0.7,show.legend = F) + boje_fill + scale_y_continuous(labels = percent) + labs(x="Fund",y="Alpha") + plot_annotation(title = "Relative Performance of Each Fund",caption = "Sources: Mapas, EOD Historical Data")
 dev.off()
-
-## 1.4. Return over costs #### 
 
 
 # PART 2. Volatility ####
@@ -182,7 +155,6 @@ emf("./slike/308_standard_deviation.emf",width = 7,height = 6)
 ggplot(std_dev_by_fund,aes(x=fund,y=std_dev_return,fill=fund)) + geom_col(alpha=0.7,show.legend = F) + boje_fill + scale_y_continuous(labels = percent) + labs(x="",y="") + plot_annotation(title = "Volatility of Each Funds' Returns",subtitle = "Standard Deviation of Weekly Returns",caption = "Sources: Mapas, EOD Historical Data")
 dev.off()
 
-
 ## 2.3. Sharpe ratio ####
 
 # Calculate Sharpe Ratio for each fund
@@ -194,11 +166,6 @@ p2 <- ggplot(sharpe_ratios,aes(x=StdDev,y=AverageReturn,col=fund)) + geom_point(
 emf("./slike/309_sharpe_ratio.emf",width = 7,height = 6)
 p1 / p2 + plot_annotation(title = "Sharpe Ratios for Each Fund",caption = "Sources: Mapas, EOD Historical Data")
 dev.off()
-
-## 2.4. Market volatility - EWMA ####
-
-
-
 
 
 # PART 3. Risk ###
@@ -263,29 +230,12 @@ dev.off()
 # PART 4. Sensitivity ####
 
 ## 4.1. Correlation matrix ####
-load("D:/mbamba/eod/eod_indeksi.Rda")
 
-start_date <- "2019-01-01" %>% as.Date()
-pom1 <- eod_indeksi %>% filter((naziv %in% c("STOXX 600 Technology ","STOXX 600 Banks ","STOXX 600 Insurance ","STOXX 600 Travel & Leisure","STOXX 600 Energy ","STOXX 600 Industrial G&S","WTI Crude Oil","Wheat","Natural Gas","Gold", "S&P 500 Index","RUSSELL 1000 GROWTH INDX","RUSSELL 1000 VALUE INDEX")) & datum>=start_date) %>% select(datum,iznos=close,naziv)
-# Cryptocurrencies
-pom2 <- fromJSON(str_c("https://eodhistoricaldata.com/api/eod/BTC-USD.CC?from=",start_date,"&to=",Sys.Date(),"&period=d&fmt=json&api_token=629ee72d6f94c6.88901546")) %>% select(datum=date,iznos=close) %>% mutate(datum=as.Date(datum),naziv="Bitcoin")
-pom3 <- fromJSON(str_c("https://eodhistoricaldata.com/api/eod/ETH-USD.CC?from=",start_date,"&to=",Sys.Date(),"&period=d&fmt=json&api_token=629ee72d6f94c6.88901546")) %>% select(datum=date,iznos=close) %>% mutate(datum=as.Date(datum),naziv="Ethereum")
-# Government Bonds
-pom4 <- rio::import("https://www.spglobal.com/spdji/en/idsexport/file.xls?hostIdentifier=48190c8c-42c4-46af-8d1a-0cd5db894797&redesignExport=true&languageId=1&selectedModule=PerformanceGraphView&selectedSubModule=Graph&yearFlag=tenYearFlag&indexId=91993075") %>% slice(4:(n()-4))
-colnames(pom4) <- c("datum","iznos")
-pom4 <- pom4 %>% mutate(datum=as.Date(as.numeric(datum), origin = "1899-12-30"),iznos=as.numeric(iznos),naziv="Government Bonds") %>% filter(datum>=start_date) 
-# Corporate Bonds
-pom5 <- eod_indeksi %>% filter(naziv=="Northern Trust Investment Grade US Corporate Bond Index" & datum>=start_date) %>% select(datum, iznos=close,naziv) %>% mutate(datum=as.Date(datum),iznos=as.numeric(iznos),naziv="Corporate Bonds")
-# sklapanje
-correlation_data <- rbind(pom1,pom2,pom3,pom4,pom5) %>% rename(date=datum,fund=naziv,value=iznos) %>% bind_rows(pension_data %>% select(date,fund,value)) %>% mutate(fund=str_wrap(fund,20))
+correlation_data <- read_excel("Day3_data.xlsx",sheet = "correlation_data") %>% mutate(date=as.Date(date)) %>% mutate(fund=str_wrap(fund,20))
+
 correlation_matrix <- correlation_data %>% spread(fund,value) %>% drop_na() %>% select(-date)
 #to make the correlation matrix plot
 corrplot.mixed(cor(correlation_matrix),lower = "number",tl.pos = "lt") #it creates the correlation matrix
 
-# cleanup
-rm(pom1,pom2,pom3,pom4,pom5)
-
-
-# 4.3. Partial correlation ####
-
-
+# Cleaning Workspace
+rm(list = ls())
