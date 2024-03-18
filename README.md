@@ -178,15 +178,16 @@ Više informacija: [WDI na CRAN-u](https://cran.r-project.org/package=WDI)
 
 ### 5. Međunarodni Monetarni Fond (MMF)
 
-Paket **IMFData** nudi pristup statističkim bazama podataka MMF-a. Možete lako pretraživati i dohvaćati podatke o različitim ekonomskim indikatorima.
+Paket **imfr** nudi pristup statističkim bazama podataka MMF-a. Možete lako pretraživati i dohvaćati podatke o različitim ekonomskim indikatorima.
 
 Instalacija i primjer koda:
 ```r
-install.packages("IMFData")
-library(IMFData)
-data <- IMFData(database_id = "IFS", indicator = "NGDPD")
+install.packages("imfr")
+library(imfr)
+# Dohvaćanje podataka o BDP-u za Sjedinjene Američke Države
+data <- imf_data(database_id = "WEO", indicator = "NGDPD", country = "US", freq = "A")
 ```
 
-Više informacija: [IMFData na CRAN-u](https://cran.r-project.org/package=IMFData)
+Više informacija: [imfr na CRAN-u](https://cran.r-project.org/web/packages/imfr/index.html)
 
 Korištenjem ovih paketa, korisnici R-a mogu efikasno pristupiti i analizirati podatke iz nekih od najvažnijih globalnih ekonomskih baza podataka, čime se olakšava donošenje informiranih odluka i provođenje dubokih analiza.
