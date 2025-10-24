@@ -814,31 +814,48 @@ fit_garch <- function(returns_vec, model = "sGARCH", dist = "std") {
 
 # Simulate paths (returns) from fitted model with optional custom z_t shocks
 sim_garch_paths <- function(fit, horizon_days, n_sims,
-                            shock_override = FALSE, shock_day = 1, shock_z = -4) {
-  # Build custom standardized innovations: matrix [horizon_days x n_sims]
-  Z <- matrix(rnorm(horizon_days * n_sims), nrow = horizon_days, ncol = n_sims)
+                            shock_override = FALSE, shock_day = 1, shock_z = -4,
+                            dist_model = "std") {
+  # Helper to get standardized-t draws if the model used Student-t
+  rzt <- function(n, df) {
+    # standardize to unit variance: t / sqrt(df/(df-2))
+    rt(n, df = df) / sqrt(df / (df - 2))
+  }
+  
   if (shock_override) {
+    # Build custom standardized innovations Z: [T x M]
+    if (dist_model == "std" && "shape" %in% names(coef(fit))) {
+      df <- as.numeric(coef(fit)["shape"])
+      Z  <- matrix(rzt(horizon_days * n_sims, df), nrow = horizon_days, ncol = n_sims)
+    } else {
+      Z  <- matrix(rnorm(horizon_days * n_sims), nrow = horizon_days, ncol = n_sims)
+    }
     if (shock_day < 1 || shock_day > horizon_days) stop("shock_day out of range")
     Z[shock_day, ] <- shock_z
+    
+    sim <- ugarchsim(
+      fit,
+      n.sim       = horizon_days,
+      m.sim       = n_sims,
+      startMethod = "sample",
+      custom.dist = list(name = "sample", distfit = Z)
+    )
+  } else {
+    # Let ugarchsim draw from the fitted distribution (norm/std)
+    sim <- ugarchsim(
+      fit,
+      n.sim       = horizon_days,
+      m.sim       = n_sims,
+      startMethod = "sample"
+    )
   }
-  # Rugarch consumes innovations column-wise for m.sim sims; provide as matrix
-  sim <- ugarchsim(
-    fit,
-    n.sim      = horizon_days,
-    m.sim      = n_sims,
-    startMethod = "sample",
-    custom.dist = list(name = "sample", distfit = Z)
-  )
-  # Extract simulated returns: matrix [horizon_days x n_sims]
-  fitted <- fitted(sim)              # mean component μ_t
-  sigma  <- sigma(sim)               # σ_t
-  # IMPORTANT: ugarchsim already used Z internally to build "seriesSim", which is r_t
-  # We can just take:
-  rmat <- fitted(sim, series = "seriesSim")  # same dims as sigma
-  # Ensure dimensions as [horizon_days x n_sims]
+  
+  # Extract simulated returns (on the same scale as the fitted data, i.e., log-returns)
+  rmat <- sim@simulation$seriesSim
   if (!is.matrix(rmat)) rmat <- as.matrix(rmat)
   rmat
 }
+
 
 # Convert simulated returns to level paths (starting from last level)
 returns_to_levels <- function(last_level, rmat) {
@@ -895,7 +912,8 @@ sim_quantiles <- map_dfr(indices, function(ix) {
   rmat <- sim_garch_paths(
     fit, horizon_days, n_sims,
     shock_override = shock_override,
-    shock_day = shock_day, shock_z = shock_z
+    shock_day = shock_day, shock_z = shock_z,
+    dist_model = dist_model
   )
   
   # Convert to level paths
@@ -942,7 +960,7 @@ cols <- c(
   "Median (50%)" = "#6A6A6A"
 )
 
-p <- ggplot() +
+ggplot() +
   geom_line(data = hist_plot_n,
             aes(datum, norm100, color = "Historical"), linewidth = 0.8) +
   geom_ribbon(data = sim_plot_n,
@@ -965,11 +983,7 @@ p <- ggplot() +
     ),
     x = "Date", y = "Index (Anchor = 100)",
     color = "Series", fill = ""
-  ) +
-  theme_minimal(base_size = 12) +
-  theme(legend.position = "bottom", panel.grid.minor = element_blank())
-
-print(p)
+  )
 
 # ------------------------ quick diagnostics ----------------------------------
 # Optional: print parameter estimates per index
