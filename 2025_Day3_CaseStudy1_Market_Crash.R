@@ -39,11 +39,12 @@ pom4 <- fromJSON("https://www.mse.mk/api/index/MBI10/12") %>% mutate(datum=as.Da
 dionice <- rbind(pom1,pom2,pom3,pom4)
 ggplot(dionice,aes(x=datum,y=iznos,col=indeks)) + geom_line() + facet_wrap(~indeks,scales="free_y")
 
+save(dionice,file = "stock_prices.Rda")
+
 # A. Historical Crash ####
 stocks <- dionice %>% filter(indeks %in% c("CROBEX","S&P 500")) %>% 
   mutate(kvartal=ceiling_date(datum,unit="quarter")-1) %>% group_by(kvartal) %>% filter(datum==max(datum)) %>% 
   select(kvartal,indeks,iznos) %>% ungroup()
-
 
 # --- Libraries ---------------------------------------------------------------
 library(dplyr)
@@ -344,4 +345,208 @@ summary_tbl <- plot_df %>%
 
 print(summary_tbl)
 
-# C. Scenario Shock ####
+# C. Beta Mapping ####
+# --- Libraries ---------------------------------------------------------------
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(purrr)
+library(scales)
+library(broom)
+
+# stocks: tibble with columns
+#   - datum  : Date (daily)
+#   - indeks : chr ("S&P 500", "CROBEX")
+#   - iznos  : numeric (index level)
+
+# ------------------------ PARAMETERS -----------------------------------------
+anchor_q_end   <- as.Date("2025-09-30")  # last observed quarter-end
+mode           <- "var"                  # "manual" or "var"
+manual_returns <- c(-0.30, -0.10, 0.12, 0.05)   # only used if mode == "manual"
+var_probs      <- c(0.01, 0.10, 0.60, 0.50)     # only used if mode == "var"
+beta_lookback_years <- 5                        # use last N years of quarterly returns for beta
+min_obs_beta        <- 12                       # minimum overlapping quarters to run regression
+
+# ------------------------ HELPERS --------------------------------------------
+
+# 1) Daily -> quarter-end level (last obs in quarter)
+to_quarter_end <- function(df) {
+  df %>%
+    mutate(q_end = ceiling_date(datum, "quarter") - days(1)) %>%
+    group_by(indeks, q_end) %>%
+    summarise(iznos = last(iznos[order(datum)]), .groups = "drop") %>%
+    arrange(indeks, q_end) %>%
+    rename(kvartal = q_end)
+}
+
+# 2) Quarterly simple returns
+quarterly_returns <- function(qdf) {
+  qdf %>%
+    group_by(indeks) %>%
+    arrange(kvartal, .by_group = TRUE) %>%
+    mutate(ret = iznos / lag(iznos) - 1) %>%
+    ungroup()
+}
+
+# 3) Next four quarter-ends after a base quarter-end
+next_four_qends <- function(base_qend) {
+  q1 <- ceiling_date(base_qend + days(1), "quarter") - days(1)
+  c(q1, q1 %m+% months(3), q1 %m+% months(6), q1 %m+% months(9))
+}
+
+# 4) Simulate path from base level using a vector of 4 returns
+simulate_path <- function(base_level, rets) {
+  Reduce(function(lvl, r) c(lvl, tail(lvl, 1) * (1 + r)),
+         rets, init = base_level) %>% tail(-1)
+}
+
+# ------------------------ PREP DATA ------------------------------------------
+
+q_series <- to_quarter_end(stocks)
+
+# pick base quarter for each index (latest <= anchor_q_end)
+anchors <- q_series %>%
+  filter(kvartal <= anchor_q_end) %>%
+  group_by(indeks) %>%
+  slice_max(kvartal, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+stopifnot(nrow(anchors) >= 1)
+
+# Quarterly returns history
+qrets <- quarterly_returns(q_series)
+
+# ------------------------ SIMULATE S&P 500 PATH ------------------------------
+
+# Base for S&P
+sp_base <- anchors %>% filter(indeks == "S&P 500")
+if (nrow(sp_base) == 0) stop("No S&P 500 base quarter on/before anchor_q_end.")
+
+sp_base_date  <- sp_base$kvartal[[1]]
+sp_base_level <- sp_base$iznos[[1]]
+sp_future_qs  <- next_four_qends(sp_base_date)
+
+# S&P returns for the 4 steps
+if (mode == "manual") {
+  sp_step_returns <- manual_returns
+  sp_label <- paste0("Sim S&P (Manual: ", paste0(percent(manual_returns), collapse = ", "), ")")
+} else if (mode == "var") {
+  sp_hist_rets <- qrets %>%
+    filter(indeks == "S&P 500", kvartal < sp_base_date) %>%
+    pull(ret) %>% na.omit()
+  if (length(sp_hist_rets) < 12) warning("Few historical S&P 500 quarterly returns for VaR.")
+  sp_step_returns <- as.numeric(quantile(sp_hist_rets, probs = var_probs, na.rm = TRUE, type = 7))
+  sp_label <- paste0("Sim S&P (VaR probs: ", paste0(var_probs, collapse = ", "), ")")
+} else {
+  stop("Unknown mode; use 'manual' or 'var'.")
+}
+
+sp_sim_levels <- simulate_path(sp_base_level, sp_step_returns)
+
+sim_sp <- tibble(
+  indeks  = "S&P 500",
+  kvartal = sp_future_qs,
+  iznos   = sp_sim_levels,
+  series  = sp_label
+)
+
+# ------------------------ ESTIMATE BETA: CROBEX on S&P -----------------------
+
+# Build overlapping return history up to the S&P base date
+aligned <- qrets %>%
+  select(indeks, kvartal, ret) %>%
+  filter(kvartal < sp_base_date) %>%
+  pivot_wider(names_from = indeks, values_from = ret) %>%
+  drop_na(`S&P 500`, CROBEX)
+
+# Restrict to lookback window (if enough data)
+lookback_start <- sp_base_date %m-% years(beta_lookback_years)
+aligned_lb <- aligned %>% filter(kvartal >= lookback_start)
+
+reg_data <- if (nrow(aligned_lb) >= min_obs_beta) aligned_lb else aligned
+
+if (nrow(reg_data) < min_obs_beta) {
+  warning("Beta estimated on only ", nrow(reg_data), " overlapping quarters (less than min_obs_beta).")
+}
+
+fit <- lm(CROBEX ~ `S&P 500`, data = reg_data)
+fit_tidy <- tidy(fit)
+fit_glance <- glance(fit)
+
+beta_est <- fit_tidy$estimate[fit_tidy$term == "`S&P 500`"]
+rsq_est  <- fit_glance$r.squared
+
+# ------------------------ MAP CROBEX VIA BETA --------------------------------
+
+# CROBEX base
+cr_base <- anchors %>% filter(indeks == "CROBEX")
+if (nrow(cr_base) == 0) stop("No CROBEX base quarter on/before anchor_q_end.")
+
+cr_base_date  <- cr_base$kvartal[[1]]
+cr_base_level <- cr_base$iznos[[1]]
+cr_future_qs  <- next_four_qends(cr_base_date)
+
+# Use the SAME sequence of quarter returns (dates) as S&P path,
+# but paths can start from index-specific base quarters. We map returns 1:1.
+cr_step_returns <- as.numeric(beta_est) * sp_step_returns
+cr_sim_levels   <- simulate_path(cr_base_level, cr_step_returns)
+
+sim_cr <- tibble(
+  indeks  = "CROBEX",
+  kvartal = cr_future_qs,
+  iznos   = cr_sim_levels,
+  series  = paste0("Sim CROBEX via β×S&P (β=", round(beta_est, 2), ", R²=", round(rsq_est, 2), ")")
+)
+
+# ------------------------ HISTORICAL SERIES (to base) ------------------------
+
+historical <- q_series %>%
+  inner_join(anchors %>% select(indeks, base_kvartal = kvartal), by = "indeks") %>%
+  filter(kvartal <= base_kvartal) %>%
+  mutate(series = "Historical") %>%
+  select(indeks, kvartal, iznos, series)
+
+plot_df <- bind_rows(historical, sim_sp, sim_cr) %>%
+  arrange(indeks, kvartal) %>%
+  group_by(indeks) %>%
+  mutate(
+    base_lvl = max(iznos[kvartal == max(kvartal[series == "Historical"])], na.rm = TRUE),
+    norm100  = 100 * iznos / base_lvl
+  ) %>%
+  ungroup()
+
+# ------------------------ PLOTS ----------------------------------------------
+
+ggplot(plot_df, aes(kvartal, norm100, color = series, linetype = series)) +
+  geom_hline(yintercept = 100, linewidth = 0.3, linetype = "dashed") +
+  geom_line(linewidth = 1) +
+  geom_point(data = plot_df %>% filter(series != "Historical"), size = 2) +
+  facet_wrap(~ indeks, scales = "free_x") + boje_col +
+  labs(
+    title = "Beta-Mapped Shock: S&P Simulated Path and CROBEX via β × ΔS&P",
+    subtitle = paste0(
+      "Beta estimated on quarterly returns (lookback: ", beta_lookback_years, "y, ",
+      nrow(reg_data), " obs).  β = ", round(beta_est, 2), ", R² = ", round(rsq_est, 2)
+    ),
+    x = "Quarter-end",
+    y = "Index (Base quarter = 100)",
+    color = "Series",
+    linetype = "Series"
+  )
+
+
+# ------------------------ QUICK SUMMARY --------------------------------------
+
+summary_tbl <- plot_df %>%
+  group_by(indeks, series) %>%
+  summarize(
+    start_q    = min(kvartal),
+    end_q      = max(kvartal),
+    start_100  = norm100[kvartal == min(kvartal)],
+    end_100    = norm100[kvartal == max(kvartal)],
+    pct_change = (end_100 / start_100 - 1) * 100,
+    .groups = "drop"
+  )
+
+print(summary_tbl)
