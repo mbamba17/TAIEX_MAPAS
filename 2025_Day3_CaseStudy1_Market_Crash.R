@@ -157,3 +157,191 @@ ggplot(paths, aes(kvartal, norm100, color = indeks)) +
     y = "Index level (Peak = 100)",
     color = "Index"
   )
+
+# B. Scenario Shock ####
+
+stocks <- dionice %>% filter(indeks %in% c("CROBEX","S&P 500")) %>% 
+  filter(datum<="2025-09-30") %>% ungroup()
+  
+# --- Libraries ---------------------------------------------------------------
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(purrr)
+library(scales)
+library(stringr)
+
+# stocks: tibble with datum (Date), indeks (chr), iznos (numeric)
+# Last value provided is 2025-09-30 (quarter-end). We'll base from each index's last available <= that date.
+
+# ------------------------ PARAMETERS YOU CAN SET ------------------------------
+
+# Choose one of: "manual" or "var"
+mode <- "var"     # "manual" for user-defined 4 returns; "var" for VaR quantiles
+
+# If mode == "manual": four quarterly % changes (as decimals)
+manual_returns <- c(-0.40, -0.10, 0.20, 0.05)
+
+# If mode == "var": four quantile probabilities (0..1)
+var_probs <- c(0.01, 0.10, 0.60, 0.50)
+
+# Base quarter-end you want to start from (your last known value)
+anchor_q_end <- as.Date("2025-09-30")
+
+# ------------------------ HELPERS --------------------------------------------
+
+# 1) Roll daily to quarter-end levels (if your data is daily). If it's already quarterly, this keeps it.
+to_quarter_end <- function(df) {
+  df %>%
+    mutate(q_end = ceiling_date(datum, "quarter") - days(1)) %>%
+    group_by(indeks, q_end) %>%
+    # last observation within each quarter as the quarter-end level
+    summarise(iznos = last(iznos[order(datum)]), .groups = "drop") %>%
+    arrange(indeks, q_end) %>%
+    rename(datum = q_end)
+}
+
+# 2) Compute simple quarterly returns
+quarterly_returns <- function(qdf) {
+  qdf %>%
+    group_by(indeks) %>%
+    arrange(datum, .by_group = TRUE) %>%
+    mutate(ret = iznos / lag(iznos) - 1) %>%
+    ungroup()
+}
+
+# 3) Next 4 quarter-ends after an anchor quarter-end
+next_four_qends <- function(anchor) {
+  q1 <- ceiling_date(anchor + days(1), "quarter") - days(1)
+  c(q1, q1 %m+% months(3), q1 %m+% months(6), q1 %m+% months(9))
+}
+
+# 4) Build simulated path given a vector of 4 returns
+simulate_path <- function(base_level, rets) {
+  # sequential compounding
+  lvls <- numeric(length(rets))
+  lvl <- base_level
+  for (i in seq_along(rets)) {
+    lvl <- lvl * (1 + rets[i])
+    lvls[i] <- lvl
+  }
+  lvls
+}
+
+# ------------------------ PREP QUARTERLY SERIES ------------------------------
+
+q_series <- to_quarter_end(stocks)
+
+# If some index doesn't have exactly anchor_q_end, use latest <= anchor_q_end
+anchors <- q_series %>%
+  group_by(indeks) %>%
+  filter(datum <= anchor_q_end) %>%
+  slice_max(datum, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+if (nrow(anchors) == 0) stop("No index has data on or before the anchor quarter.")
+
+# Prepare historical returns for VaR path
+q_with_rets <- quarterly_returns(q_series)
+
+# Future quarter-ends to simulate
+future_qs <- next_four_qends(anchors$datum %>% max())  # calendar only; each index still uses its own base
+
+# ------------------------ BUILD SIMULATED PATHS ------------------------------
+
+sim_paths <- map_dfr(unique(anchors$indeks), function(ix) {
+  base_row <- anchors %>% filter(indeks == ix)
+  if (nrow(base_row) == 0) return(tibble())
+  base_date  <- base_row$datum[[1]]
+  base_level <- base_row$iznos[[1]]
+  
+  # If base_date < anchor_q_end (index missing 2025-09-30), we still simulate forward from its latest
+  sim_dates <- next_four_qends(base_date)
+  
+  if (mode == "manual") {
+    step_returns <- manual_returns
+    label <- paste0("Simulated (Manual: ",
+                    paste0(percent(manual_returns), collapse = ", "), ")")
+  } else if (mode == "var") {
+    # historical returns available strictly before base_date
+    hist_rets <- q_with_rets %>%
+      filter(indeks == ix, datum < base_date) %>%
+      pull(ret) %>%
+      na.omit()
+    if (length(hist_rets) < 8) {
+      warning("Few historical quarterly returns for ", ix, " — VaR quantiles may be unstable.")
+    }
+    step_returns <- as.numeric(quantile(hist_rets, probs = var_probs, na.rm = TRUE, type = 7))
+    label <- paste0("Simulated (VaR probs: ", paste0(var_probs, collapse = ", "), ")")
+  } else {
+    stop("Unknown mode. Use 'manual' or 'var'.")
+  }
+  
+  # Simulated levels
+  sim_lvls <- simulate_path(base_level, step_returns)
+  
+  tibble(
+    indeks   = ix,
+    datum  = sim_dates,
+    iznos    = sim_lvls,
+    series   = label
+  )
+})
+
+# Historical up to anchor (per index -> up to its base date)
+historical <- q_series %>%
+  inner_join(anchors %>% select(indeks, base_kvartal = datum), by = "indeks") %>%
+  filter(datum <= base_kvartal) %>%
+  select(indeks, datum, iznos) %>%
+  mutate(series = "Historical")
+
+plot_df <- bind_rows(historical, sim_paths)
+
+# Sanity: order
+plot_df <- plot_df %>%
+  arrange(indeks, datum) %>%
+  group_by(indeks) %>%
+  mutate(
+    # normalize to 100 at the base quarter for easier visual comparison
+    base_lvl = max(iznos[datum == max(datum[series == "Historical"])], na.rm = TRUE),
+    norm100  = 100 * iznos / base_lvl
+  ) %>%
+  ungroup()
+
+# ------------------------ PLOT -----------------------------------------------
+
+ggplot(plot_df, aes(datum, norm100, color = series, linetype = series)) +
+  geom_hline(yintercept = 100, linewidth = 0.3, linetype = "dashed") +
+  geom_line(linewidth = 1) +
+  geom_point(data = plot_df %>% filter(series != "Historical"),
+             size = 2) +
+  facet_wrap(~ indeks, scales = "free_x") + boje_col +
+  labs(
+    title = "Historical Index vs. Simulated 4-Quarter Path",
+    subtitle = if (mode == "manual")
+      paste0("Manual quarterly returns: ", paste0(percent(manual_returns), collapse = ", "))
+    else
+      paste0("VaR-based quarterly steps using historical returns | probs: ",
+             paste0(var_probs, collapse = ", ")),
+    x = "Quarter-end",
+    y = "Index (Base quarter = 100)",
+    color = "Series", linetype = "Series"
+  )
+
+# ------------------------ QUICK SUMMARY --------------------------------------
+
+summary_tbl <- plot_df %>%
+  group_by(indeks, series) %>%
+  summarize(
+    start_q   = min(datum),
+    end_q     = max(datum),
+    start_100 = norm100[datum == min(datum)],
+    end_100   = norm100[datum == max(datum)],
+    pct_change = (end_100 / start_100 - 1) * 100,
+    .groups = "drop"
+  )
+
+print(summary_tbl)
+
+# C. Scenario Shock ####
