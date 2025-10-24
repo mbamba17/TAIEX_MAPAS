@@ -550,3 +550,209 @@ summary_tbl <- plot_df %>%
   )
 
 print(summary_tbl)
+
+# D. Monte Carlo ####
+# --- Libraries ---------------------------------------------------------------
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(purrr)
+library(scales)
+library(stringr)
+
+set.seed(42)  # reproducibility
+
+# ------------------------ PARAMETERS -----------------------------------------
+horizon_days        <- 252     # ~1 trading year
+n_sims              <- 5000    # number of Monte Carlo paths per index
+var_levels          <- c(0.01, 0.025, 0.05)  # 1%, 2.5%, 5%
+lookback_years      <- 5       # use last N years of daily returns
+use_block_bootstrap <- FALSE   # TRUE = simple 5-day blocks to keep some clustering
+block_len           <- 5
+history_years_on_plot <- 3     # how many years of historical levels to show
+
+# ------------------------ HELPERS --------------------------------------------
+# Generate next N business days (Mon-Fri) after a given date
+next_n_bdays <- function(start_date, n) {
+  # over-generate then filter Mon–Fri via wday (1=Mon,..,7=Sun with week_start=1)
+  d <- seq.Date(from = start_date + lubridate::days(1), by = "day", length.out = n * 3)
+  b <- d[lubridate::wday(d, week_start = 1) <= 5]
+  b[seq_len(n)]
+}
+
+future_dates <- next_n_bdays(anchor_date, horizon_days)
+
+# Build daily log returns over a lookback window
+prep_log_rets <- function(df_idx, anchor_date, lookback_years) {
+  df <- df_idx %>%
+    arrange(datum) %>%
+    filter(datum <= anchor_date,
+           datum >= anchor_date %m-% years(lookback_years)) %>%
+    mutate(r = log(iznos) - log(lag(iznos))) %>%
+    filter(is.finite(r), !is.na(r))
+  df$r
+}
+
+# Simple block bootstrap of log returns
+sample_block_boot <- function(logrets, horizon_days, block_len) {
+  n_blocks <- ceiling(horizon_days / block_len)
+  # starting indices for overlapping blocks
+  starts <- sample.int(length(logrets) - block_len + 1L, size = n_blocks, replace = TRUE)
+  sam <- unlist(lapply(starts, function(s) logrets[s:(s + block_len - 1L)]), use.names = FALSE)
+  sam[seq_len(horizon_days)]
+}
+
+# IID empirical sampling of log returns
+sample_iid <- function(logrets, horizon_days) {
+  sample(logrets, size = horizon_days, replace = TRUE)
+}
+
+# Simulate n_sims paths (levels) for one index
+simulate_paths <- function(last_level, logrets_hist, horizon_days, n_sims,
+                           use_block_bootstrap = FALSE, block_len = 5) {
+  sim_mat <- matrix(NA_real_, nrow = horizon_days, ncol = n_sims)
+  for (j in seq_len(n_sims)) {
+    draws <- if (use_block_bootstrap) {
+      sample_block_boot(logrets_hist, horizon_days, block_len)
+    } else {
+      sample_iid(logrets_hist, horizon_days)
+    }
+    # cumulative log-returns -> level path
+    sim_mat[, j] <- as.numeric(last_level * exp(cumsum(draws)))
+  }
+  sim_mat
+}
+
+# Pointwise quantiles for each day across simulations
+pointwise_quantiles <- function(sim_mat, probs) {
+  apply(sim_mat, 1, quantile, probs = probs, na.rm = TRUE) %>% t() %>% as.data.frame()
+}
+
+# ------------------------ PREP DATA ------------------------------------------
+# Expect: stocks with datum (Date), indeks, iznos
+stopifnot(all(c("datum", "indeks", "iznos") %in% names(stocks)))
+indices <- unique(stocks$indeks)
+
+anchor_date <- max(stocks$datum, na.rm = TRUE)
+
+# Historical levels to display (last X years)
+hist_levels <- stocks %>%
+  filter(datum >= anchor_date %m-% years(history_years_on_plot),
+         datum <= anchor_date) %>%
+  arrange(indeks, datum) %>%
+  mutate(series = "Historical")
+
+# Future business-day dates
+future_dates <- next_n_bdays(anchor_date, horizon_days)
+
+# ------------------------ RUN MONTE CARLO PER INDEX --------------------------
+sim_quantiles_long <- purrr::map_dfr(indices, function(ix) {
+  df_idx <- stocks %>% dplyr::filter(indeks == ix)
+  last_row <- df_idx %>% dplyr::filter(datum == max(datum)) %>% dplyr::slice_tail(n = 1)
+  last_level <- last_row$iznos[[1]]
+  
+  # Historical log returns (lookback)
+  logrets <- prep_log_rets(df_idx, anchor_date, lookback_years)
+  if (length(logrets) < 60) {
+    warning("Very few daily returns for ", ix, " in lookback; expanding to all history.")
+    logrets <- df_idx %>%
+      dplyr::arrange(datum) %>%
+      dplyr::mutate(r = log(iznos) - log(dplyr::lag(iznos))) %>%
+      dplyr::filter(is.finite(r), !is.na(r)) %>%
+      dplyr::pull(r)
+  }
+  
+  # Simulate
+  sim_mat <- simulate_paths(
+    last_level, logrets, horizon_days, n_sims,
+    use_block_bootstrap = use_block_bootstrap, block_len = block_len
+  )
+  
+  # Pointwise quantiles (ensure fixed order & names)
+  probs <- c(0.01, 0.025, 0.05, 0.50)
+  q_mat <- apply(sim_mat, 1, stats::quantile, probs = probs, na.rm = TRUE) # 4 x T
+  q_df  <- as.data.frame(t(q_mat))                                         # T x 4
+  names(q_df) <- c("q1", "q2_5", "q5", "q50")
+  
+  tibble::tibble(
+    indeks = ix,
+    datum  = future_dates,
+    q1     = q_df$q1,
+    q2_5   = q_df$q2_5,
+    q5     = q_df$q5,
+    q50    = q_df$q50
+  )
+})
+
+# ------------------------ COMBINE FOR PLOTTING -------------------------------
+# Normalize each index to 100 at anchor_date for a clean comparison
+base_levels <- hist_levels %>%
+  group_by(indeks) %>%
+  slice_max(datum, n = 1) %>%
+  transmute(indeks, base = iznos)
+
+hist_plot <- hist_levels %>%
+  left_join(base_levels, by = "indeks") %>%
+  mutate(norm100 = 100 * iznos / base)
+
+sim_plot <- sim_quantiles_long %>%
+  left_join(base_levels, by = "indeks") %>%
+  mutate(
+    norm_q1   = 100 * q1   / base,
+    norm_q2_5 = 100 * q2_5 / base,
+    norm_q5   = 100 * q5   / base,
+    norm_q50  = 100 * q50  / base
+  )
+
+# ------------------------ PLOTS ----------------------------------------------
+cols <- c(
+  "Historical"   = "#2C7FB8",
+  "VaR 2.5% path"= "#F03B20",
+  "Median (50%)" = "#6A6A6A"
+)
+
+ggplot() +
+  # historical
+  geom_line(data = hist_plot,
+            aes(datum, norm100, color = "Historical"), linewidth = 0.8) +
+  # worst band: 1%..5%
+  geom_ribbon(data = sim_plot,
+              aes(datum, ymin = norm_q1, ymax = norm_q5, fill = "1%–5% band"),
+              alpha = 0.25, inherit.aes = FALSE) +
+  # VaR 2.5% path
+  geom_line(data = sim_plot,
+            aes(datum, norm_q2_5, color = "VaR 2.5% path"), linewidth = 1) +
+  # (optional) median
+  geom_line(data = sim_plot,
+            aes(datum, norm_q50, color = "Median (50%)"), linewidth = 0.5, linetype = "dashed") +
+  facet_wrap(~ indeks, scales = "free_y") +
+  scale_color_manual(values = cols) +
+  scale_fill_manual(values = c("1%–5% band" = "#F03B20")) +
+  labs(
+    title = "Monte Carlo (Daily): Worst-Case Bands & VaR 2.5% Path for Next Year",
+    subtitle = paste0(
+      "Empirical resampling of daily log returns (lookback ", lookback_years,
+      "y, ", n_sims, " sims). Ribbon = 1%–5% worst band; line = 2.5% path."
+    ),
+    x = "Date", y = "Index (Anchor = 100)",
+    color = "Series", fill = ""
+  )
+
+
+# ------------------------ QUICK CHECKS ---------------------------------------
+# Show implied one-day VaR (historical) for reference
+var_table <- stocks %>%
+  group_by(indeks) %>%
+  filter(datum <= anchor_date, datum >= anchor_date %m-% years(lookback_years)) %>%
+  arrange(datum, .by_group = TRUE) %>%
+  mutate(r = iznos / lag(iznos) - 1) %>%
+  summarize(
+    n_days   = sum(!is.na(r)),
+    VaR_2_5d = quantile(r, probs = 0.025, na.rm = TRUE),
+    VaR_1d   = quantile(r, probs = 0.01,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(starts_with("VaR_"), ~ scales::percent(.x, accuracy = 0.01)))
+
+print(var_table)
