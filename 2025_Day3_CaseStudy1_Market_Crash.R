@@ -756,3 +756,222 @@ var_table <- stocks %>%
   mutate(across(starts_with("VaR_"), ~ scales::percent(.x, accuracy = 0.01)))
 
 print(var_table)
+
+# E. GARCH simulation ####
+# --- Libraries ---------------------------------------------------------------
+# install.packages(c("rugarch","dplyr","tidyr","lubridate","ggplot2","purrr","scales"))
+library(rugarch)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(purrr)
+library(scales)
+
+set.seed(42)
+
+# ------------------------ PARAMETERS -----------------------------------------
+horizon_days         <- 252        # ~1 trading year
+n_sims               <- 5000       # Monte Carlo paths per index
+history_years_plot   <- 3          # years of history to show on the chart
+fit_lookback_years   <- 7          # years of daily data to fit the model
+garch_model          <- "sGARCH"   # "sGARCH" or "eGARCH"
+dist_model           <- "std"      # "norm" or "std" (Student-t; better tails)
+shock_override       <- TRUE       # inject a large negative shock on day 1?
+shock_day            <- 1          # which simulated day gets the shock
+shock_z              <- -4         # standardized innovation z_t to force (e.g., -4σ)
+
+# ------------------------ HELPERS --------------------------------------------
+# Next N business days (Mon-Fri), locale-agnostic
+next_n_bdays <- function(start_date, n) {
+  d <- seq.Date(from = start_date + days(1), by = "day", length.out = n * 3)
+  b <- d[wday(d, week_start = 1) <= 5]
+  b[seq_len(n)]
+}
+
+# Prepare daily log-returns with a lookback window
+prep_logrets <- function(df_idx, anchor_date, lookback_years) {
+  df_idx %>%
+    arrange(datum) %>%
+    filter(datum <= anchor_date,
+           datum >= anchor_date %m-% years(lookback_years)) %>%
+    transmute(
+      datum,
+      r = log(iznos) - log(lag(iznos))
+    ) %>%
+    filter(is.finite(r), !is.na(r))
+}
+
+# Fit (E)GARCH(1,1) to log-returns
+fit_garch <- function(returns_vec, model = "sGARCH", dist = "std") {
+  spec <- ugarchspec(
+    variance.model = list(model = model, garchOrder = c(1,1)),
+    mean.model     = list(armaOrder = c(0,0), include.mean = TRUE),
+    distribution.model = dist
+  )
+  ugarchfit(spec = spec, data = returns_vec, solver = "hybrid")
+}
+
+# Simulate paths (returns) from fitted model with optional custom z_t shocks
+sim_garch_paths <- function(fit, horizon_days, n_sims,
+                            shock_override = FALSE, shock_day = 1, shock_z = -4) {
+  # Build custom standardized innovations: matrix [horizon_days x n_sims]
+  Z <- matrix(rnorm(horizon_days * n_sims), nrow = horizon_days, ncol = n_sims)
+  if (shock_override) {
+    if (shock_day < 1 || shock_day > horizon_days) stop("shock_day out of range")
+    Z[shock_day, ] <- shock_z
+  }
+  # Rugarch consumes innovations column-wise for m.sim sims; provide as matrix
+  sim <- ugarchsim(
+    fit,
+    n.sim      = horizon_days,
+    m.sim      = n_sims,
+    startMethod = "sample",
+    custom.dist = list(name = "sample", distfit = Z)
+  )
+  # Extract simulated returns: matrix [horizon_days x n_sims]
+  fitted <- fitted(sim)              # mean component μ_t
+  sigma  <- sigma(sim)               # σ_t
+  # IMPORTANT: ugarchsim already used Z internally to build "seriesSim", which is r_t
+  # We can just take:
+  rmat <- fitted(sim, series = "seriesSim")  # same dims as sigma
+  # Ensure dimensions as [horizon_days x n_sims]
+  if (!is.matrix(rmat)) rmat <- as.matrix(rmat)
+  rmat
+}
+
+# Convert simulated returns to level paths (starting from last level)
+returns_to_levels <- function(last_level, rmat) {
+  # rmat is (T x M) of simple or log returns? seriesSim gives simulated *returns*:
+  # For rugarch, the simulated series is on the same scale as input (we used log-returns),
+  # so exponentiate cumulative sum to get price levels.
+  paths <- apply(rmat, 2, function(r) last_level * exp(cumsum(r)))
+  # Ensure T x M
+  if (is.null(dim(paths))) paths <- matrix(paths, nrow = nrow(rmat))
+  paths
+}
+
+# Pointwise quantiles across simulations (rows=time)
+pointwise_q <- function(mat, probs) {
+  apply(mat, 1, quantile, probs = probs, na.rm = TRUE) |> t() |> as.data.frame()
+}
+
+# ------------------------ PREP DATA ------------------------------------------
+stopifnot(all(c("datum","indeks","iznos") %in% names(stocks)))
+anchor_date <- max(stocks$datum, na.rm = TRUE)
+indices     <- unique(stocks$indeks)
+
+# Historical levels to plot (last N years)
+hist_plot <- stocks %>%
+  filter(datum >= anchor_date %m-% years(history_years_plot),
+         datum <= anchor_date) %>%
+  arrange(indeks, datum) %>%
+  mutate(series = "Historical")
+
+# Future business days
+future_dates <- next_n_bdays(anchor_date, horizon_days)
+
+# ------------------------ RUN PER INDEX --------------------------------------
+sim_quantiles <- map_dfr(indices, function(ix) {
+  df_idx <- stocks %>% filter(indeks == ix)
+  last_row <- df_idx %>% filter(datum == max(datum)) %>% slice_tail(n = 1)
+  last_level <- last_row$iznos[[1]]
+  
+  # Prepare returns for fitting
+  r_df <- prep_logrets(df_idx, anchor_date, fit_lookback_years)
+  # If too few obs, expand to full history
+  if (nrow(r_df) < 250) {
+    r_df <- df_idx %>%
+      arrange(datum) %>%
+      transmute(datum, r = log(iznos) - log(lag(iznos))) %>%
+      filter(is.finite(r), !is.na(r))
+  }
+  if (nrow(r_df) < 100) stop("Not enough return history to fit GARCH for ", ix)
+  
+  # Fit model
+  fit <- fit_garch(r_df$r, model = garch_model, dist = dist_model)
+  
+  # Simulate returns matrix
+  rmat <- sim_garch_paths(
+    fit, horizon_days, n_sims,
+    shock_override = shock_override,
+    shock_day = shock_day, shock_z = shock_z
+  )
+  
+  # Convert to level paths
+  lmat <- returns_to_levels(last_level, rmat)
+  
+  # Pointwise quantiles (1%, 2.5%, 5%, median)
+  probs <- c(0.01, 0.025, 0.05, 0.50)
+  qdf   <- pointwise_q(lmat, probs)
+  names(qdf) <- c("q1","q2_5","q5","q50")
+  
+  tibble(
+    indeks = ix,
+    datum  = future_dates,
+    q1     = qdf$q1,
+    q2_5   = qdf$q2_5,
+    q5     = qdf$q5,
+    q50    = qdf$q50
+  )
+})
+
+# ------------------------ NORMALIZE & COMBINE --------------------------------
+base_levels <- hist_plot %>%
+  group_by(indeks) %>%
+  slice_max(datum, n = 1) %>%
+  transmute(indeks, base = iznos)
+
+hist_plot_n <- hist_plot %>%
+  left_join(base_levels, by = "indeks") %>%
+  mutate(norm100 = 100 * iznos / base)
+
+sim_plot_n <- sim_quantiles %>%
+  left_join(base_levels, by = "indeks") %>%
+  mutate(
+    norm_q1   = 100 * q1   / base,
+    norm_q2_5 = 100 * q2_5 / base,
+    norm_q5   = 100 * q5   / base,
+    norm_q50  = 100 * q50  / base
+  )
+
+# ------------------------ PLOT ------------------------------------------------
+cols <- c(
+  "Historical"   = "#2C7FB8",
+  "VaR 2.5% path"= "#F03B20",
+  "Median (50%)" = "#6A6A6A"
+)
+
+p <- ggplot() +
+  geom_line(data = hist_plot_n,
+            aes(datum, norm100, color = "Historical"), linewidth = 0.8) +
+  geom_ribbon(data = sim_plot_n,
+              aes(datum, ymin = norm_q1, ymax = norm_q5, fill = "1%–5% band"),
+              alpha = 0.25) +
+  geom_line(data = sim_plot_n,
+            aes(datum, norm_q2_5, color = "VaR 2.5% path"), linewidth = 1) +
+  geom_line(data = sim_plot_n,
+            aes(datum, norm_q50, color = "Median (50%)"),
+            linewidth = 0.6, linetype = "dashed") +
+  facet_wrap(~ indeks, scales = "free_y") +
+  scale_color_manual(values = cols) +
+  scale_fill_manual(values = c("1%–5% band" = "#F03B20")) +
+  labs(
+    title = paste0("GARCH Monte Carlo (", garch_model, ", dist=", dist_model, "): Worst Bands & VaR 2.5% Path"),
+    subtitle = paste0(
+      "Lookback fit: ", fit_lookback_years, "y. ",
+      if (shock_override) paste0("Shock override: z[", shock_day, "] = ", shock_z, ". ") else "",
+      n_sims, " sims, horizon ~", horizon_days, " business days."
+    ),
+    x = "Date", y = "Index (Anchor = 100)",
+    color = "Series", fill = ""
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", panel.grid.minor = element_blank())
+
+print(p)
+
+# ------------------------ quick diagnostics ----------------------------------
+# Optional: print parameter estimates per index
+# You can run this separately per index if you want details like alpha/beta, shape (t-dof), etc.
+
